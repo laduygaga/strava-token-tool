@@ -225,9 +225,9 @@ function tokensPage(t, error) {
       async function test() {
         const out = document.getElementById('out');
         out.hidden = false; out.textContent = 'GET /v4/users/me/dataTypes/exercise/dataPoints ...';
-        const r = await fetch('/test');
+        const r = await fetch('/v4/users/me/dataTypes/exercise/dataPoints');
         const j = await r.json();
-        out.textContent = 'HTTP ' + j.status + '\\n\\n' + JSON.stringify(j.body, null, 2);
+        out.textContent = 'HTTP ' + r.status + '\\n\\n' + JSON.stringify(j, null, 2);
       }
     </script>
   `);
@@ -326,6 +326,30 @@ async function handler(req, res) {
         return send(res, 200, connectPage(cfg, state, error));
       }
       return send(res, 200, tokensPage(tokens));
+    }
+
+    if (req.method === 'GET' && pathname === '/v4/users/me/dataTypes/exercise/dataPoints') {
+      let tokens = loadTokens(req);
+      if (!tokens) return send(res, 401, JSON.stringify({ error: 'Not connected.' }), { 'content-type': 'application/json' });
+      if (isExpired(tokens)) {
+        try {
+          tokens = await refresh(cfg, res, tokens);
+        } catch (e) {
+          return send(res, 401, JSON.stringify({ error: `Token refresh failed: ${e.message}` }), { 'content-type': 'application/json' });
+        }
+      }
+      const targetUrl = `${API}/users/me/dataTypes/exercise/dataPoints${url.search}`;
+      const r = await fetch(targetUrl, {
+        headers: { authorization: `Bearer ${tokens.access_token}` },
+      });
+      const text = await r.text();
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = { raw: text };
+      }
+      return send(res, r.status, JSON.stringify(body), { 'content-type': 'application/json' });
     }
 
     if (pathname === '/test') {
