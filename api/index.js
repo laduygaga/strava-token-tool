@@ -246,8 +246,6 @@ function tokensPage(t, error) {
     <h1>Connected</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
     ${field('App token (for /dataPoints?token=...)', appToken)}
-    ${field('Access token', t.access_token)}
-    ${field('Refresh token', t.refresh_token)}
     <p>Expires ${esc(new Date(t.expires_at * 1000).toLocaleString())}
        &middot; scope <code>${esc(t.scope || 'n/a')}</code></p>
     <p style="font-size:13px; opacity:.85;">API endpoint: <code>/dataPoints?token=${esc(appToken)}</code></p>
@@ -394,6 +392,20 @@ async function handler(req, res) {
       let body;
       try {
         body = JSON.parse(text);
+        if (Array.isArray(body.dataPoints)) {
+          body.dataPoints = body.dataPoints
+            .filter((dp) => dp?.dataSource?.recordingMethod !== 'MANUAL')
+            .map((dp) => {
+              const nameParts = (dp.name || '').split('/');
+              const recordId = nameParts[nameParts.length - 1] || '';
+              const metrics = dp.exercise?.metricsSummary || {};
+              return {
+                recordId,
+                distanceMillimeters: metrics.distanceMillimeters,
+                averagePaceSecondsPerMeter: metrics.averagePaceSecondsPerMeter,
+              };
+            });
+        }
       } catch {
         body = { raw: text };
       }
