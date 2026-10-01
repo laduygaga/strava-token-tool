@@ -245,33 +245,11 @@ function tokensPage(t, error) {
   return page(`
     <h1>Connected</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
-    ${field('App token (for /dataPoints?token=...)', appToken)}
-    <p>Expires ${esc(new Date(t.expires_at * 1000).toLocaleString())}
-       &middot; scope <code>${esc(t.scope || 'n/a')}</code></p>
-    <p style="font-size:13px; opacity:.85;">API endpoint: <code>/dataPoints?token=${esc(appToken)}</code></p>
-    <div class="row">
-      <button onclick="test()">Test exercise dataPoints</button>
-      <form method="post" action="/refresh" style="margin:0">
-        <button class="ghost">Refresh access token</button>
-      </form>
-      <form method="post" action="/disconnect" style="margin:0">
-        <button class="ghost">Disconnect</button>
-      </form>
-    </div>
-    <pre id="out" hidden></pre>
+    ${field('App token', appToken)}
     <script>
       function copy(id, btn) {
         navigator.clipboard.writeText(document.getElementById(id).textContent);
         btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy', 1200);
-      }
-      async function test() {
-        const out = document.getElementById('out');
-        out.hidden = false; out.textContent = 'GET /v4/users/me/dataTypes/exercise/dataPoints ...';
-        const r = await fetch('/v4/users/me/dataTypes/exercise/dataPoints', {
-          headers: { 'Authorization': 'Bearer ${t.access_token}' }
-        });
-        const j = await r.json();
-        out.textContent = 'HTTP ' + r.status + '\\n\\n' + JSON.stringify(j, null, 2);
       }
     </script>
   `);
