@@ -71,6 +71,24 @@ function normalize(raw, prev = {}) {
   };
 }
 
+function parseTokenString(val) {
+  if (!val) return null;
+  try {
+    const raw = Buffer.from(val, 'base64url').toString('utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && (parsed.access_token || parsed.refresh_token)) return parsed;
+  } catch {}
+  return { access_token: val, expires_at: Math.floor(Date.now() / 1000) + 3600 };
+}
+
+function cleanSearch(url) {
+  const params = new URLSearchParams(url.searchParams);
+  params.delete('__path');
+  params.delete('token');
+  const s = params.toString();
+  return s ? `?${s}` : '';
+}
+
 // ---------- cookies & tokens ----------
 
 function parseCookies(req) {
@@ -87,36 +105,34 @@ function parseCookies(req) {
 
 function loadTokens(req) {
   if (req) {
-    // 1. Check Authorization header
+    // 1. Check query parameter ?token=...
+    try {
+      const rawUrl = req.headers['x-invoke-path'] || req.headers['x-forwarded-uri'] || req.headers['x-matched-path'] || req.url;
+      const u = new URL(rawUrl, 'http://localhost');
+      const queryToken = u.searchParams.get('token');
+      if (queryToken) {
+        const resolved = parseTokenString(queryToken);
+        if (resolved) return resolved;
+      }
+    } catch {}
+
+    // 2. Check Authorization header
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
       const tokenVal = authHeader.slice(7).trim();
-      try {
-        const raw = Buffer.from(tokenVal, 'base64url').toString('utf8');
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.access_token) return parsed;
-      } catch {}
-      if (tokenVal) {
-        return { access_token: tokenVal, expires_at: Math.floor(Date.now() / 1000) + 3600 };
-      }
+      const resolved = parseTokenString(tokenVal);
+      if (resolved) return resolved;
     }
 
-    // 2. Check HTTP-only cookie
+    // 3. Check HTTP-only cookie
     const cookies = parseCookies(req);
     if (cookies.google_health_tokens) {
-      const cookieVal = cookies.google_health_tokens;
-      try {
-        const raw = Buffer.from(cookieVal, 'base64url').toString('utf8');
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.access_token) return parsed;
-      } catch {}
-      if (cookieVal) {
-        return { access_token: cookieVal, expires_at: Math.floor(Date.now() / 1000) + 3600 };
-      }
+      const resolved = parseTokenString(cookies.google_health_tokens);
+      if (resolved) return resolved;
     }
   }
 
-  // 3. Fallback to tokens.json if present locally
+  // 4. Fallback to tokens.json if present locally
   try {
     const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
     if (!text) return null;
@@ -219,6 +235,7 @@ function connectPage(cfg, state, error) {
 }
 
 function tokensPage(t, error) {
+  const appToken = Buffer.from(JSON.stringify(t)).toString('base64url');
   const field = (label, value) => `
     <label>${label}</label>
     <div class="row">
@@ -228,10 +245,12 @@ function tokensPage(t, error) {
   return page(`
     <h1>Connected</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
+    ${field('App token (for /dataPoints?token=...)', appToken)}
     ${field('Access token', t.access_token)}
     ${field('Refresh token', t.refresh_token)}
     <p>Expires ${esc(new Date(t.expires_at * 1000).toLocaleString())}
        &middot; scope <code>${esc(t.scope || 'n/a')}</code></p>
+    <p style="font-size:13px; opacity:.85;">API endpoint: <code>/dataPoints?token=${esc(appToken)}</code></p>
     <div class="row">
       <button onclick="test()">Test exercise dataPoints</button>
       <form method="post" action="/refresh" style="margin:0">
@@ -250,7 +269,9 @@ function tokensPage(t, error) {
       async function test() {
         const out = document.getElementById('out');
         out.hidden = false; out.textContent = 'GET /v4/users/me/dataTypes/exercise/dataPoints ...';
-        const r = await fetch('/v4/users/me/dataTypes/exercise/dataPoints');
+        const r = await fetch('/v4/users/me/dataTypes/exercise/dataPoints', {
+          headers: { 'Authorization': 'Bearer ${t.access_token}' }
+        });
         const j = await r.json();
         out.textContent = 'HTTP ' + r.status + '\\n\\n' + JSON.stringify(j, null, 2);
       }
@@ -355,7 +376,7 @@ async function handler(req, res) {
       return send(res, 200, tokensPage(tokens));
     }
 
-    if (req.method === 'GET' && pathname === '/v4/users/me/dataTypes/exercise/dataPoints') {
+    if (req.method === 'GET' && (pathname === '/v4/users/me/dataTypes/exercise/dataPoints' || pathname === '/dataPoints')) {
       let tokens = loadTokens(req);
       if (!tokens) return send(res, 401, JSON.stringify({ error: 'Not connected.' }), { 'content-type': 'application/json' });
       if (isExpired(tokens)) {
@@ -365,7 +386,7 @@ async function handler(req, res) {
           return send(res, 401, JSON.stringify({ error: `Token refresh failed: ${e.message}` }), { 'content-type': 'application/json' });
         }
       }
-      const targetUrl = `${API}/users/me/dataTypes/exercise/dataPoints${url.search}`;
+      const targetUrl = `${API}/users/me/dataTypes/exercise/dataPoints${cleanSearch(url)}`;
       const r = await fetch(targetUrl, {
         headers: { authorization: `Bearer ${tokens.access_token}` },
       });
