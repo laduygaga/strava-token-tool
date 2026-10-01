@@ -99,7 +99,9 @@ function loadTokens(req) {
 
   // 2. Fallback to tokens.json if present locally
   try {
-    return JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+    const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
+    if (!text) return null;
+    return JSON.parse(text);
   } catch {
     return null;
   }
@@ -123,10 +125,14 @@ function saveTokens(res, t) {
 
 function clearTokens(res) {
   if (res) {
-    appendCookie(res, 'google_health_tokens=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    appendCookie(res, 'google_health_tokens=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+    appendCookie(res, 'google_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
   }
   try {
-    fs.rmSync(TOKENS_FILE, { force: true });
+    if (fs.existsSync(TOKENS_FILE)) {
+      fs.truncateSync(TOKENS_FILE, 0);
+      fs.unlinkSync(TOKENS_FILE);
+    }
   } catch {}
 }
 
@@ -278,7 +284,7 @@ async function handler(req, res) {
       }
     }
 
-    if (req.method === 'POST' && pathname === '/disconnect') {
+    if (pathname === '/disconnect') {
       clearTokens(res);
       return redirect(res, '/');
     }
@@ -321,8 +327,10 @@ async function handler(req, res) {
         }
       }
       if (!tokens) {
-        const state = crypto.randomBytes(16).toString('hex');
-        appendCookie(res, `google_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+        const state = cookies.google_state || crypto.randomBytes(16).toString('hex');
+        if (!cookies.google_state) {
+          appendCookie(res, `google_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+        }
         return send(res, 200, connectPage(cfg, state, error));
       }
       return send(res, 200, tokensPage(tokens));
