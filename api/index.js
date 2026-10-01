@@ -86,18 +86,37 @@ function parseCookies(req) {
 }
 
 function loadTokens(req) {
-  // 1. Check HTTP-only cookie first
   if (req) {
+    // 1. Check Authorization header
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+      const tokenVal = authHeader.slice(7).trim();
+      try {
+        const raw = Buffer.from(tokenVal, 'base64url').toString('utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.access_token) return parsed;
+      } catch {}
+      if (tokenVal) {
+        return { access_token: tokenVal, expires_at: Math.floor(Date.now() / 1000) + 3600 };
+      }
+    }
+
+    // 2. Check HTTP-only cookie
     const cookies = parseCookies(req);
     if (cookies.google_health_tokens) {
+      const cookieVal = cookies.google_health_tokens;
       try {
-        const raw = Buffer.from(cookies.google_health_tokens, 'base64url').toString('utf8');
-        return JSON.parse(raw);
+        const raw = Buffer.from(cookieVal, 'base64url').toString('utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.access_token) return parsed;
       } catch {}
+      if (cookieVal) {
+        return { access_token: cookieVal, expires_at: Math.floor(Date.now() / 1000) + 3600 };
+      }
     }
   }
 
-  // 2. Fallback to tokens.json if present locally
+  // 3. Fallback to tokens.json if present locally
   try {
     const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
     if (!text) return null;
@@ -255,7 +274,7 @@ async function handler(req, res) {
   }
 
   // Parse original URL from Vercel proxy headers or req.url
-  const rawUrl = req.headers['x-forwarded-uri'] || req.url;
+  const rawUrl = req.headers['x-invoke-path'] || req.headers['x-forwarded-uri'] || req.headers['x-matched-path'] || req.url;
   const url = new URL(rawUrl, cfg.baseUrl);
   const cookies = parseCookies(req);
 
