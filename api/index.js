@@ -36,7 +36,7 @@ function loadConfig(req) {
   };
 
   if (req) {
-    const proto = req.headers['x-forwarded-proto'] || 'http';
+    const proto = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:8080';
     cfg.baseUrl = `${proto}://${host}`;
     cfg.redirectUri = `${cfg.baseUrl}/callback`;
@@ -248,11 +248,26 @@ async function handler(req, res) {
     return send(res, 500, page('<p class="err">Missing <code>GOOGLE_CLIENT_ID</code> or <code>GOOGLE_CLIENT_SECRET</code> environment variables.</p>'));
   }
 
-  const url = new URL(req.url, cfg.baseUrl);
+  // Parse original URL from Vercel proxy headers or req.url
+  const rawUrl = req.headers['x-forwarded-uri'] || req.url;
+  const url = new URL(rawUrl, cfg.baseUrl);
   const cookies = parseCookies(req);
 
+  // Extract normalized pathname
+  let pathname = url.pathname;
+  if (pathname === '/api/index' || pathname === '/api') {
+    pathname = '/';
+  } else if (pathname.startsWith('/api/index/')) {
+    pathname = pathname.replace('/api/index', '');
+  } else if (pathname.startsWith('/api/')) {
+    pathname = pathname.replace('/api', '');
+  }
+
+  // Detect OAuth callback
+  const isCallback = pathname === '/callback' || (url.searchParams.has('code') && url.searchParams.has('state')) || url.searchParams.has('error');
+
   try {
-    if (req.method === 'POST' && url.pathname === '/refresh') {
+    if (req.method === 'POST' && pathname === '/refresh') {
       const tokens = loadTokens(req);
       if (!tokens) return redirect(res, '/');
       try {
@@ -263,12 +278,38 @@ async function handler(req, res) {
       }
     }
 
-    if (req.method === 'POST' && url.pathname === '/disconnect') {
+    if (req.method === 'POST' && pathname === '/disconnect') {
       clearTokens(res);
       return redirect(res, '/');
     }
 
-    if (url.pathname === '/') {
+    if (isCallback) {
+      const err = url.searchParams.get('error');
+      const stateParam = url.searchParams.get('state');
+      const expectedState = cookies.google_state;
+
+      if (err) {
+        const newState = crypto.randomBytes(16).toString('hex');
+        appendCookie(res, `google_state=${newState}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+        return send(res, 400, connectPage(cfg, newState, `Google said: ${err}`));
+      }
+
+      if (expectedState && stateParam !== expectedState) {
+        return send(res, 400, page('<p class="err">Bad or stale <code>state</code> parameter. Start again at <a href="/">/</a>.</p>'));
+      }
+
+      appendCookie(res, 'google_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+
+      const granted = await tokenRequest(cfg, {
+        grant_type: 'authorization_code',
+        code: url.searchParams.get('code'),
+        redirect_uri: cfg.redirectUri,
+      });
+      saveTokens(res, normalize(granted));
+      return redirect(res, '/');
+    }
+
+    if (pathname === '/' || pathname === '') {
       let tokens = loadTokens(req);
       let error = null;
       if (tokens && isExpired(tokens)) {
@@ -287,33 +328,7 @@ async function handler(req, res) {
       return send(res, 200, tokensPage(tokens));
     }
 
-    if (url.pathname === '/callback') {
-      const err = url.searchParams.get('error');
-      const stateParam = url.searchParams.get('state');
-      const expectedState = cookies.google_state;
-
-      if (err) {
-        const newState = crypto.randomBytes(16).toString('hex');
-        appendCookie(res, `google_state=${newState}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
-        return send(res, 400, connectPage(cfg, newState, `Google said: ${err}`));
-      }
-
-      if (!expectedState || stateParam !== expectedState) {
-        return send(res, 400, page('<p class="err">Bad or stale <code>state</code>. Start again at <a href="/">/</a>.</p>'));
-      }
-
-      appendCookie(res, 'google_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
-
-      const granted = await tokenRequest(cfg, {
-        grant_type: 'authorization_code',
-        code: url.searchParams.get('code'),
-        redirect_uri: cfg.redirectUri,
-      });
-      saveTokens(res, normalize(granted));
-      return redirect(res, '/');
-    }
-
-    if (url.pathname === '/test') {
+    if (pathname === '/test') {
       let tokens = loadTokens(req);
       if (!tokens) return send(res, 200, JSON.stringify({ status: 0, body: 'Not connected.' }), { 'content-type': 'application/json' });
       if (isExpired(tokens)) tokens = await refresh(cfg, res, tokens);
