@@ -29,7 +29,7 @@ function start() {
   const server = http.createServer(handler);
 
   server.listen(port, () => {
-    console.log(`Strava token tool running locally: http://localhost:${port}`);
+    console.log(`Google Health token tool running locally: http://localhost:${port}`);
     console.log(`OAuth callback URL: http://localhost:${port}/callback`);
   });
 }

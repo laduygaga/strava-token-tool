@@ -5,7 +5,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.json');
-const DEFAULT_SCOPE = 'read,activity:read_all,profile:read_all';
+const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const API = 'https://health.googleapis.com/v4';
+const DEFAULT_SCOPE = 'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly';
 const SKEW_SECONDS = 60; // refresh a minute early rather than racing expiry
 
 // ---------- config ----------
@@ -27,9 +30,9 @@ function loadConfig(req) {
   } catch {}
   const get = (k, d) => process.env[k] || file[k] || d;
   const cfg = {
-    clientId: get('STRAVA_CLIENT_ID'),
-    clientSecret: get('STRAVA_CLIENT_SECRET'),
-    scope: get('STRAVA_SCOPE', DEFAULT_SCOPE),
+    clientId: get('GOOGLE_CLIENT_ID'),
+    clientSecret: get('GOOGLE_CLIENT_SECRET'),
+    scope: get('GOOGLE_SCOPE', DEFAULT_SCOPE),
   };
 
   if (req) {
@@ -47,14 +50,26 @@ function authorizeUrl(cfg, state) {
     client_id: cfg.clientId,
     redirect_uri: cfg.redirectUri,
     response_type: 'code',
-    approval_prompt: 'auto',
     scope: cfg.scope,
     state,
+    access_type: 'offline', // required for Google to issue a refresh token
+    prompt: 'consent', // ensures consent and refresh token re-issuance
+    include_granted_scopes: 'true',
   });
-  return `https://www.strava.com/oauth/authorize?${q}`;
+  return `${AUTH_URL}?${q}`;
 }
 
 const isExpired = (t) => !t || !t.expires_at || t.expires_at - SKEW_SECONDS <= Date.now() / 1000;
+
+function normalize(raw, prev = {}) {
+  return {
+    access_token: raw.access_token,
+    refresh_token: raw.refresh_token || prev.refresh_token,
+    expires_at: Math.floor(Date.now() / 1000) + Number(raw.expires_in || 3600),
+    scope: raw.scope || prev.scope,
+    token_type: raw.token_type || 'Bearer',
+  };
+}
 
 // ---------- cookies & tokens ----------
 
@@ -74,9 +89,9 @@ function loadTokens(req) {
   // 1. Check HTTP-only cookie first
   if (req) {
     const cookies = parseCookies(req);
-    if (cookies.strava_tokens) {
+    if (cookies.google_health_tokens) {
       try {
-        const raw = Buffer.from(cookies.strava_tokens, 'base64url').toString('utf8');
+        const raw = Buffer.from(cookies.google_health_tokens, 'base64url').toString('utf8');
         return JSON.parse(raw);
       } catch {}
     }
@@ -95,7 +110,7 @@ function saveTokens(res, t) {
   if (res) {
     const val = Buffer.from(JSON.stringify(t)).toString('base64url');
     const maxAge = 365 * 24 * 3600; // 1 year
-    appendCookie(res, `strava_tokens=${val}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+    appendCookie(res, `google_health_tokens=${val}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
   }
 
   // 2. Also write locally to tokens.json if writable environment
@@ -108,7 +123,7 @@ function saveTokens(res, t) {
 
 function clearTokens(res) {
   if (res) {
-    appendCookie(res, 'strava_tokens=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    appendCookie(res, 'google_health_tokens=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
   }
   try {
     fs.rmSync(TOKENS_FILE, { force: true });
@@ -127,13 +142,13 @@ function appendCookie(res, cookieStr) {
 }
 
 async function tokenRequest(cfg, body) {
-  const res = await fetch('https://www.strava.com/oauth/token', {
+  const res = await fetch(TOKEN_URL, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...body }),
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...body }),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`Strava token endpoint returned ${res.status}: ${text}`);
+  if (!res.ok) throw new Error(`Google token endpoint returned ${res.status}: ${text}`);
   return JSON.parse(text);
 }
 
@@ -142,7 +157,7 @@ async function refresh(cfg, res, tokens) {
     grant_type: 'refresh_token',
     refresh_token: tokens.refresh_token,
   });
-  return saveTokens(res, { ...fresh, athlete: tokens.athlete });
+  return saveTokens(res, normalize(fresh, tokens));
 }
 
 // ---------- html ----------
@@ -151,13 +166,13 @@ const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const CSS = `
-  :root { color-scheme: light dark; --fc: #fc4c02; }
+  :root { color-scheme: light dark; --g: #1a73e8; }
   body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem; }
   h1 { font-size: 1.4rem; }
-  a.btn, button { background: var(--fc); color: #fff; border: 0; border-radius: 6px;
+  a.btn, button { background: var(--g); color: #fff; border: 0; border-radius: 6px;
     padding: .6rem 1rem; font: inherit; cursor: pointer; text-decoration: none; display: inline-block; }
   button.ghost { background: transparent; color: inherit; border: 1px solid currentColor; opacity: .7; }
-  .row { display: flex; gap: .5rem; align-items: center; margin: .35rem 0 1rem; }
+  .row { display: flex; gap: .5rem; align-items: center; margin: .35rem 0 1rem; flex-wrap: wrap; }
   code, pre { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
   code.tok { background: rgba(127,127,127,.18); padding: .5rem .6rem; border-radius: 6px;
     flex: 1; overflow-wrap: anywhere; }
@@ -167,14 +182,14 @@ const CSS = `
 `;
 
 const page = (body) => `<!doctype html><html><head><meta charset="utf-8">
-<title>Strava token</title><style>${CSS}</style></head><body>${body}</body></html>`;
+<title>Google Health token</title><style>${CSS}</style></head><body>${body}</body></html>`;
 
 function connectPage(cfg, state, error) {
   return page(`
-    <h1>Strava access token</h1>
+    <h1>Google Health access token</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
-    <p>Scopes: <code>${esc(cfg.scope)}</code></p>
-    <p><a class="btn" href="${esc(authorizeUrl(cfg, state))}">Connect with Strava</a></p>
+    <p>Scope: <code>${esc(cfg.scope)}</code></p>
+    <p><a class="btn" href="${esc(authorizeUrl(cfg, state))}">Sign in with Google</a></p>
   `);
 }
 
@@ -182,19 +197,18 @@ function tokensPage(t, error) {
   const field = (label, value) => `
     <label>${label}</label>
     <div class="row">
-      <code class="tok" id="${label.replace(/\W/g, '')}">${esc(value)}</code>
+      <code class="tok" id="${label.replace(/\W/g, '')}">${esc(value || '(none)')}</code>
       <button class="ghost" onclick="copy('${label.replace(/\W/g, '')}', this)">Copy</button>
     </div>`;
-  const name = t.athlete ? `${t.athlete.firstname || ''} ${t.athlete.lastname || ''}`.trim() : '';
   return page(`
-    <h1>Connected${name ? ` as ${esc(name)}` : ''}</h1>
+    <h1>Connected</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
     ${field('Access token', t.access_token)}
     ${field('Refresh token', t.refresh_token)}
     <p>Expires ${esc(new Date(t.expires_at * 1000).toLocaleString())}
        &middot; scope <code>${esc(t.scope || 'n/a')}</code></p>
     <div class="row">
-      <button onclick="test()">Test /athlete</button>
+      <button onclick="test()">Test exercise dataPoints</button>
       <form method="post" action="/refresh" style="margin:0">
         <button class="ghost">Refresh access token</button>
       </form>
@@ -210,7 +224,7 @@ function tokensPage(t, error) {
       }
       async function test() {
         const out = document.getElementById('out');
-        out.hidden = false; out.textContent = 'GET /api/v3/athlete ...';
+        out.hidden = false; out.textContent = 'GET /v4/users/me/dataTypes/exercise/dataPoints ...';
         const r = await fetch('/test');
         const j = await r.json();
         out.textContent = 'HTTP ' + j.status + '\\n\\n' + JSON.stringify(j.body, null, 2);
@@ -231,7 +245,7 @@ const redirect = (res, to) => send(res, 302, '', { location: to });
 async function handler(req, res) {
   const cfg = loadConfig(req);
   if (!cfg.clientId || !cfg.clientSecret) {
-    return send(res, 500, page('<p class="err">Missing <code>STRAVA_CLIENT_ID</code> or <code>STRAVA_CLIENT_SECRET</code> environment variables.</p>'));
+    return send(res, 500, page('<p class="err">Missing <code>GOOGLE_CLIENT_ID</code> or <code>GOOGLE_CLIENT_SECRET</code> environment variables.</p>'));
   }
 
   const url = new URL(req.url, cfg.baseUrl);
@@ -262,12 +276,12 @@ async function handler(req, res) {
           tokens = await refresh(cfg, res, tokens);
         } catch (e) {
           tokens = null;
-          error = `Refresh failed, authorize again. ${e.message}`;
+          error = `Refresh failed, sign in again. ${e.message}`;
         }
       }
       if (!tokens) {
         const state = crypto.randomBytes(16).toString('hex');
-        appendCookie(res, `strava_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+        appendCookie(res, `google_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
         return send(res, 200, connectPage(cfg, state, error));
       }
       return send(res, 200, tokensPage(tokens));
@@ -276,25 +290,26 @@ async function handler(req, res) {
     if (url.pathname === '/callback') {
       const err = url.searchParams.get('error');
       const stateParam = url.searchParams.get('state');
-      const expectedState = cookies.strava_state;
+      const expectedState = cookies.google_state;
 
       if (err) {
         const newState = crypto.randomBytes(16).toString('hex');
-        appendCookie(res, `strava_state=${newState}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
-        return send(res, 400, connectPage(cfg, newState, `Strava said: ${err}`));
+        appendCookie(res, `google_state=${newState}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+        return send(res, 400, connectPage(cfg, newState, `Google said: ${err}`));
       }
 
       if (!expectedState || stateParam !== expectedState) {
         return send(res, 400, page('<p class="err">Bad or stale <code>state</code>. Start again at <a href="/">/</a>.</p>'));
       }
 
-      appendCookie(res, 'strava_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+      appendCookie(res, 'google_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
 
       const granted = await tokenRequest(cfg, {
         grant_type: 'authorization_code',
         code: url.searchParams.get('code'),
+        redirect_uri: cfg.redirectUri,
       });
-      saveTokens(res, granted);
+      saveTokens(res, normalize(granted));
       return redirect(res, '/');
     }
 
@@ -302,7 +317,7 @@ async function handler(req, res) {
       let tokens = loadTokens(req);
       if (!tokens) return send(res, 200, JSON.stringify({ status: 0, body: 'Not connected.' }), { 'content-type': 'application/json' });
       if (isExpired(tokens)) tokens = await refresh(cfg, res, tokens);
-      const r = await fetch('https://www.strava.com/api/v3/athlete', {
+      const r = await fetch(`${API}/users/me/dataTypes/exercise/dataPoints`, {
         headers: { authorization: `Bearer ${tokens.access_token}` },
       });
       const body = await r.json().catch(() => null);

@@ -1,7 +1,7 @@
 {
-  "name": "strava-token-tool",
+  "name": "google-health-token-tool",
   "version": "1.0.0",
-  "description": "Strava OAuth token tool for Vercel and local usage",
+  "description": "Google Health OAuth token tool for Vercel and local usage",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
