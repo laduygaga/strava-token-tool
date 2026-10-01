@@ -1,0 +1,12 @@
+{
+  "name": "strava-token-tool",
+  "version": "1.0.0",
+  "description": "Strava OAuth token tool for Vercel and local usage",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
