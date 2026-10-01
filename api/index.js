@@ -279,7 +279,7 @@ async function handler(req, res) {
   const cookies = parseCookies(req);
 
   // Extract normalized pathname
-  let pathname = url.pathname;
+  let pathname = url.searchParams.get('__path') || url.pathname;
   if (pathname === '/api/index' || pathname === '/api') {
     pathname = '/';
   } else if (pathname.startsWith('/api/index/')) {
