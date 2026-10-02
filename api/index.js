@@ -11,6 +11,26 @@ const API = 'https://health.googleapis.com/v4';
 const DEFAULT_SCOPE = 'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly';
 const SKEW_SECONDS = 60; // refresh a minute early rather than racing expiry
 
+const CLIENT_KEY_TOKENS = new Map();
+
+function encodeState(csrf, clientKey) {
+  if (!clientKey) return csrf;
+  return `${csrf}:${Buffer.from(clientKey).toString('base64url')}`;
+}
+
+function decodeState(stateParam) {
+  if (!stateParam) return { csrf: '', clientKey: null };
+  const parts = stateParam.split(':');
+  const csrf = parts[0];
+  let clientKey = null;
+  if (parts.length > 1) {
+    try {
+      clientKey = Buffer.from(parts[1], 'base64url').toString('utf8');
+    } catch {}
+  }
+  return { csrf, clientKey };
+}
+
 // ---------- config ----------
 
 function parseEnv(text) {
@@ -85,6 +105,8 @@ function cleanSearch(url) {
   const params = new URLSearchParams(url.searchParams);
   params.delete('__path');
   params.delete('token');
+  params.delete('clientKey');
+  params.delete('client_key');
   const s = params.toString();
   return s ? `?${s}` : '';
 }
@@ -103,28 +125,62 @@ function parseCookies(req) {
   return list;
 }
 
-function loadTokens(req) {
+function loadClientKeysFile() {
+  try {
+    const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
+    if (!text) return {};
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && parsed.clientKeys) {
+      return parsed.clientKeys;
+    }
+  } catch {}
+  return {};
+}
+
+function loadTokens(req, targetClientKey) {
+  let clientKey = targetClientKey;
   if (req) {
-    // 1. Check query parameter ?token=...
+    let queryToken = null;
     try {
       const rawUrl = req.headers['x-invoke-path'] || req.headers['x-forwarded-uri'] || req.headers['x-matched-path'] || req.url;
       const u = new URL(rawUrl, 'http://localhost');
-      const queryToken = u.searchParams.get('token');
-      if (queryToken) {
-        const resolved = parseTokenString(queryToken);
-        if (resolved) return resolved;
-      }
+      clientKey = clientKey || u.searchParams.get('clientKey') || u.searchParams.get('client_key');
+      queryToken = u.searchParams.get('token');
     } catch {}
 
-    // 2. Check Authorization header
+    clientKey = clientKey || req.headers['x-client-key'];
+
+    if (clientKey) {
+      if (CLIENT_KEY_TOKENS.has(clientKey)) {
+        return CLIENT_KEY_TOKENS.get(clientKey);
+      }
+      const fileKeys = loadClientKeysFile();
+      if (fileKeys[clientKey]) {
+        CLIENT_KEY_TOKENS.set(clientKey, fileKeys[clientKey]);
+        return fileKeys[clientKey];
+      }
+    }
+
+    if (queryToken) {
+      const resolved = parseTokenString(queryToken);
+      if (resolved) return resolved;
+    }
+
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
       const tokenVal = authHeader.slice(7).trim();
+      if (CLIENT_KEY_TOKENS.has(tokenVal)) {
+        return CLIENT_KEY_TOKENS.get(tokenVal);
+      }
+      const fileKeys = loadClientKeysFile();
+      if (fileKeys[tokenVal]) {
+        CLIENT_KEY_TOKENS.set(tokenVal, fileKeys[tokenVal]);
+        return fileKeys[tokenVal];
+      }
       const resolved = parseTokenString(tokenVal);
       if (resolved) return resolved;
     }
 
-    // 3. Check HTTP-only cookie
     const cookies = parseCookies(req);
     if (cookies.google_health_tokens) {
       const resolved = parseTokenString(cookies.google_health_tokens);
@@ -132,27 +188,49 @@ function loadTokens(req) {
     }
   }
 
-  // 4. Fallback to tokens.json if present locally
   try {
     const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
     if (!text) return null;
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+    const parsed = JSON.parse(text);
+    if (parsed.access_token || parsed.refresh_token) return parsed;
+  } catch {}
+
+  return null;
 }
 
-function saveTokens(res, t) {
-  // 1. Save in HTTP-only Cookie for stateless Vercel deployment
+function saveTokens(res, t, clientKey) {
+  if (clientKey) {
+    CLIENT_KEY_TOKENS.set(clientKey, t);
+  }
+
   if (res) {
     const val = Buffer.from(JSON.stringify(t)).toString('base64url');
     const maxAge = 365 * 24 * 3600; // 1 year
     appendCookie(res, `google_health_tokens=${val}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+    if (clientKey) {
+      appendCookie(res, `google_client_key=${encodeURIComponent(clientKey)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+    }
   }
 
-  // 2. Also write locally to tokens.json if writable environment
   try {
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(t, null, 2) + '\n', { mode: 0o600 });
+    let current = {};
+    try {
+      const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
+      if (text) current = JSON.parse(text);
+    } catch {}
+
+    current.access_token = t.access_token;
+    current.refresh_token = t.refresh_token;
+    current.expires_at = t.expires_at;
+    current.scope = t.scope;
+    current.token_type = t.token_type;
+
+    if (clientKey) {
+      if (!current.clientKeys) current.clientKeys = {};
+      current.clientKeys[clientKey] = t;
+    }
+
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(current, null, 2) + '\n', { mode: 0o600 });
   } catch {}
 
   return t;
@@ -161,6 +239,7 @@ function saveTokens(res, t) {
 function clearTokens(res) {
   if (res) {
     appendCookie(res, 'google_health_tokens=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+    appendCookie(res, 'google_client_key=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
     appendCookie(res, 'google_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
   }
   try {
@@ -193,12 +272,12 @@ async function tokenRequest(cfg, body) {
   return JSON.parse(text);
 }
 
-async function refresh(cfg, res, tokens) {
+async function refresh(cfg, res, tokens, clientKey) {
   const fresh = await tokenRequest(cfg, {
     grant_type: 'refresh_token',
     refresh_token: tokens.refresh_token,
   });
-  return saveTokens(res, normalize(fresh, tokens));
+  return saveTokens(res, normalize(fresh, tokens), clientKey);
 }
 
 // ---------- html ----------
@@ -225,16 +304,17 @@ const CSS = `
 const page = (body) => `<!doctype html><html><head><meta charset="utf-8">
 <title>Google Health token</title><style>${CSS}</style></head><body>${body}</body></html>`;
 
-function connectPage(cfg, state, error) {
+function connectPage(cfg, state, error, clientKey) {
   return page(`
     <h1>Google Health access token</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
+    ${clientKey ? `<p>Linking Client Key: <code>${esc(clientKey)}</code></p>` : ''}
     <p>Scope: <code>${esc(cfg.scope)}</code></p>
     <p><a class="btn" href="${esc(authorizeUrl(cfg, state))}">Sign in with Google</a></p>
   `);
 }
 
-function tokensPage(t, error) {
+function tokensPage(t, error, clientKey) {
   const appToken = Buffer.from(JSON.stringify(t)).toString('base64url');
   const field = (label, value) => `
     <label>${label}</label>
@@ -245,6 +325,7 @@ function tokensPage(t, error) {
   return page(`
     <h1>Connected</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
+    ${clientKey ? field('Client Key', clientKey) : ''}
     ${field('App token', appToken)}
     <script>
       function copy(id, btn) {
@@ -274,6 +355,7 @@ async function handler(req, res) {
   const rawUrl = req.headers['x-invoke-path'] || req.headers['x-forwarded-uri'] || req.headers['x-matched-path'] || req.url;
   const url = new URL(rawUrl, cfg.baseUrl);
   const cookies = parseCookies(req);
+  const clientKey = url.searchParams.get('clientKey') || url.searchParams.get('client_key') || cookies.google_client_key;
 
   // Extract normalized pathname
   let pathname = url.searchParams.get('__path') || url.pathname;
@@ -290,13 +372,13 @@ async function handler(req, res) {
 
   try {
     if (req.method === 'POST' && pathname === '/refresh') {
-      const tokens = loadTokens(req);
+      const tokens = loadTokens(req, clientKey);
       if (!tokens) return redirect(res, '/');
       try {
-        const fresh = await refresh(cfg, res, tokens);
-        return send(res, 200, tokensPage(fresh));
+        const fresh = await refresh(cfg, res, tokens, clientKey);
+        return send(res, 200, tokensPage(fresh, null, clientKey));
       } catch (e) {
-        return send(res, 200, tokensPage(tokens, `Refresh failed: ${e.message}`));
+        return send(res, 200, tokensPage(tokens, `Refresh failed: ${e.message}`, clientKey));
       }
     }
 
@@ -308,15 +390,18 @@ async function handler(req, res) {
     if (isCallback) {
       const err = url.searchParams.get('error');
       const stateParam = url.searchParams.get('state');
+      const { csrf: stateCsrf, clientKey: stateClientKey } = decodeState(stateParam);
       const expectedState = cookies.google_state;
 
       if (err) {
-        const newState = crypto.randomBytes(16).toString('hex');
-        appendCookie(res, `google_state=${newState}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
-        return send(res, 400, connectPage(cfg, newState, `Google said: ${err}`));
+        const newCsrf = crypto.randomBytes(16).toString('hex');
+        const effectiveClientKey = stateClientKey || clientKey;
+        const newState = encodeState(newCsrf, effectiveClientKey);
+        appendCookie(res, `google_state=${newCsrf}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+        return send(res, 400, connectPage(cfg, newState, `Google said: ${err}`, effectiveClientKey));
       }
 
-      if (expectedState && stateParam !== expectedState) {
+      if (expectedState && stateCsrf !== expectedState) {
         return send(res, 400, page('<p class="err">Bad or stale <code>state</code> parameter. Start again at <a href="/">/</a>.</p>'));
       }
 
@@ -327,37 +412,39 @@ async function handler(req, res) {
         code: url.searchParams.get('code'),
         redirect_uri: cfg.redirectUri,
       });
-      saveTokens(res, normalize(granted));
-      return redirect(res, '/');
+      const resolvedClientKey = stateClientKey || clientKey;
+      saveTokens(res, normalize(granted), resolvedClientKey);
+      return redirect(res, resolvedClientKey ? `/?clientKey=${encodeURIComponent(resolvedClientKey)}` : '/');
     }
 
     if (pathname === '/' || pathname === '') {
-      let tokens = loadTokens(req);
+      let tokens = loadTokens(req, clientKey);
       let error = null;
       if (tokens && isExpired(tokens)) {
         try {
-          tokens = await refresh(cfg, res, tokens);
+          tokens = await refresh(cfg, res, tokens, clientKey);
         } catch (e) {
           tokens = null;
           error = `Refresh failed, sign in again. ${e.message}`;
         }
       }
       if (!tokens) {
-        const state = cookies.google_state || crypto.randomBytes(16).toString('hex');
+        const csrf = cookies.google_state || crypto.randomBytes(16).toString('hex');
         if (!cookies.google_state) {
-          appendCookie(res, `google_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
+          appendCookie(res, `google_state=${csrf}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`);
         }
-        return send(res, 200, connectPage(cfg, state, error));
+        const state = encodeState(csrf, clientKey);
+        return send(res, 200, connectPage(cfg, state, error, clientKey));
       }
-      return send(res, 200, tokensPage(tokens));
+      return send(res, 200, tokensPage(tokens, error, clientKey));
     }
 
     if (req.method === 'GET' && (pathname === '/v4/users/me/dataTypes/exercise/dataPoints' || pathname === '/dataPoints')) {
-      let tokens = loadTokens(req);
+      let tokens = loadTokens(req, clientKey);
       if (!tokens) return send(res, 401, JSON.stringify({ error: 'Not connected.' }), { 'content-type': 'application/json' });
       if (isExpired(tokens)) {
         try {
-          tokens = await refresh(cfg, res, tokens);
+          tokens = await refresh(cfg, res, tokens, clientKey);
         } catch (e) {
           return send(res, 401, JSON.stringify({ error: `Token refresh failed: ${e.message}` }), { 'content-type': 'application/json' });
         }
@@ -391,9 +478,9 @@ async function handler(req, res) {
     }
 
     if (pathname === '/test') {
-      let tokens = loadTokens(req);
+      let tokens = loadTokens(req, clientKey);
       if (!tokens) return send(res, 200, JSON.stringify({ status: 0, body: 'Not connected.' }), { 'content-type': 'application/json' });
-      if (isExpired(tokens)) tokens = await refresh(cfg, res, tokens);
+      if (isExpired(tokens)) tokens = await refresh(cfg, res, tokens, clientKey);
       const r = await fetch(`${API}/users/me/dataTypes/exercise/dataPoints`, {
         headers: { authorization: `Bearer ${tokens.access_token}` },
       });
