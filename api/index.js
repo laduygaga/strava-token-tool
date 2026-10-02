@@ -834,24 +834,16 @@ async function handler(req, res) {
       }
 
       const redis = getRedis(cfg);
-      const stats = await loadGameStats(redis, clientKey);
-      const awarded = [];
-      const rejected = [];
+      const totalStats = await loadGameStats(redis, clientKey);
+      let awardedCount = 0;
       let syncStr = 0;
       let syncAgi = 0;
 
       try {
         for (const rec of records) {
           if (!rec.recordId) continue;
-          if (!isPlausibleRecord(rec)) {
-            rejected.push({ recordId: rec.recordId, reason: 'implausible' });
-            continue;
-          }
-
-          if (syncStr + syncAgi >= STAT_RULES.maxStatsPerSync) {
-            rejected.push({ recordId: rec.recordId, reason: 'sync-cap-reached' });
-            continue;
-          }
+          if (!isPlausibleRecord(rec)) continue;
+          if (syncStr + syncAgi >= STAT_RULES.maxStatsPerSync) continue;
 
           const isNew = await reserveRecord(redis, clientKey, rec.recordId);
           if (!isNew) continue;
@@ -859,7 +851,7 @@ async function handler(req, res) {
           const delta = statsForRecord(rec);
           syncStr += delta.str;
           syncAgi += delta.agi;
-          awarded.push({ recordId: rec.recordId, ...delta });
+          awardedCount++;
         }
       } catch (e) {
         if (e.message === 'record-store-unavailable') {
@@ -868,16 +860,14 @@ async function handler(req, res) {
         throw e;
       }
 
-      stats.str += syncStr;
-      stats.agi += syncAgi;
-      stats.recordCount += awarded.length;
-      await saveGameStats(redis, clientKey, stats);
+      totalStats.str += syncStr;
+      totalStats.agi += syncAgi;
+      totalStats.recordCount += awardedCount;
+      await saveGameStats(redis, clientKey, totalStats);
 
       return send(res, status, JSON.stringify({
-        stats,
-        awarded,
-        rejected,
-        awardedCount: awarded.length,
+        stats: { str: syncStr, agi: syncAgi },
+        awardedCount,
       }), { 'content-type': 'application/json' });
     }
 
