@@ -917,7 +917,11 @@ async function handler(req, res) {
     if (pathname === '/quiz' && req.method === 'GET') {
       const bank = await loadQuizBank(cfg);
       const questions = Object.values(bank);
-      return send(res, 200, JSON.stringify({ count: questions.length, questions }), { 'content-type': 'application/json' });
+      if (questions.length === 0) {
+        return send(res, 404, JSON.stringify({ error: 'Quiz bank is empty.' }), { 'content-type': 'application/json' });
+      }
+      const question = questions[Math.floor(Math.random() * questions.length)];
+      return send(res, 200, JSON.stringify({ question }), { 'content-type': 'application/json' });
     }
 
     if (pathname === '/quiz' && (req.method === 'POST' || req.method === 'PUT')) {
