@@ -234,6 +234,136 @@ async function fetchExerciseRecords(url, tokens) {
   return { status: r.status, records: normalizeDataPoints(body), raw: body };
 }
 
+// ---------- quiz bank ----------
+
+const QUIZ_CSV_FILE = path.join(process.cwd(), 'quiz-bank.csv');
+const QUIZ_REDIS_KEY = 'quiz:bank';
+const QUIZ_BANK_MEM = { data: null };
+
+// Column order in quiz-bank.csv mapped to the normalized question shape.
+const QUIZ_COLUMNS = [
+  'id', 'context', 'question',
+  'choiceA', 'choiceB', 'choiceC', 'choiceD',
+  'correctAnswer', 'deltaStr', 'deltaInt', 'deltaAgi', 'deltaCha',
+  'feedbackCorrect', 'feedbackWrong', 'learning',
+];
+
+const QUIZ_NUMERIC_FIELDS = new Set(['deltaStr', 'deltaInt', 'deltaAgi', 'deltaCha']);
+
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 1_000_000) {
+        reject(new Error('body-too-large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(raw));
+    req.on('error', reject);
+  });
+}
+
+async function readJsonBody(req) {
+  const raw = await readRawBody(req);
+  if (!raw.trim()) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('invalid-json');
+  }
+}
+
+// RFC-4180 CSV parser: handles quoted fields containing commas, newlines, and
+// escaped double-quotes (""). The quiz source has commas inside quoted cells.
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.length > 1 || row[0] !== '') rows.push(row);
+      row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function rowToQuestion(row) {
+  const q = {};
+  QUIZ_COLUMNS.forEach((key, i) => {
+    const val = row[i] != null ? row[i] : '';
+    q[key] = QUIZ_NUMERIC_FIELDS.has(key) ? Number(val) || 0 : val;
+  });
+  return q;
+}
+
+function parseQuizCsv(text) {
+  const rows = parseCsvRows(text);
+  const bank = {};
+  for (let i = 1; i < rows.length; i++) {
+    const q = rowToQuestion(rows[i]);
+    if (q.id) bank[q.id] = q;
+  }
+  return bank;
+}
+
+async function loadQuizBank(cfg) {
+  const redis = getRedis(cfg);
+  if (redis) {
+    try {
+      const val = await redis.get(QUIZ_REDIS_KEY);
+      if (val) return typeof val === 'string' ? JSON.parse(val) : val;
+    } catch (e) {
+      console.error('Error reading quiz bank from Redis:', e);
+    }
+  } else if (QUIZ_BANK_MEM.data) {
+    return QUIZ_BANK_MEM.data;
+  }
+
+  // First use: seed from the CSV that ships with the app.
+  let seeded = {};
+  try {
+    seeded = parseQuizCsv(fs.readFileSync(QUIZ_CSV_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Error seeding quiz bank from CSV:', e);
+  }
+  await saveQuizBank(cfg, seeded);
+  return seeded;
+}
+
+async function saveQuizBank(cfg, bank) {
+  const redis = getRedis(cfg);
+  if (redis) {
+    try {
+      await redis.set(QUIZ_REDIS_KEY, JSON.stringify(bank));
+      return;
+    } catch (e) {
+      console.error('Error saving quiz bank to Redis:', e);
+    }
+  }
+  QUIZ_BANK_MEM.data = bank;
+}
+
 function normalize(raw, prev = {}) {
   return {
     access_token: raw.access_token,
@@ -749,6 +879,77 @@ async function handler(req, res) {
         rejected,
         awardedCount: awarded.length,
       }), { 'content-type': 'application/json' });
+    }
+
+    if (pathname === '/quiz/import' && (req.method === 'POST' || req.method === 'PUT')) {
+      let raw;
+      try {
+        raw = await readRawBody(req);
+      } catch (e) {
+        const msg = e.message === 'body-too-large' ? 'Request body too large.' : 'Could not read body.';
+        return send(res, 400, JSON.stringify({ error: msg }), { 'content-type': 'application/json' });
+      }
+
+      const incoming = parseQuizCsv(raw);
+      const ids = Object.keys(incoming);
+      if (ids.length === 0) {
+        return send(res, 400, JSON.stringify({ error: 'No valid rows found. Expected CSV with a header row and an ID column.' }), { 'content-type': 'application/json' });
+      }
+
+      const bank = await loadQuizBank(cfg);
+      const created = [];
+      const updated = [];
+      for (const id of ids) {
+        if (id in bank) updated.push(id);
+        else created.push(id);
+        bank[id] = incoming[id];
+      }
+      await saveQuizBank(cfg, bank);
+
+      return send(res, 200, JSON.stringify({
+        imported: ids.length,
+        created,
+        updated,
+        total: Object.keys(bank).length,
+      }), { 'content-type': 'application/json' });
+    }
+
+    if (pathname === '/quiz' && req.method === 'GET') {
+      const bank = await loadQuizBank(cfg);
+      const questions = Object.values(bank);
+      return send(res, 200, JSON.stringify({ count: questions.length, questions }), { 'content-type': 'application/json' });
+    }
+
+    if (pathname === '/quiz' && (req.method === 'POST' || req.method === 'PUT')) {
+      let payload;
+      try {
+        payload = await readJsonBody(req);
+      } catch (e) {
+        const msg = e.message === 'body-too-large' ? 'Request body too large.' : 'Invalid JSON body.';
+        return send(res, 400, JSON.stringify({ error: msg }), { 'content-type': 'application/json' });
+      }
+
+      const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+      if (!id) {
+        return send(res, 400, JSON.stringify({ error: 'Missing question id.' }), { 'content-type': 'application/json' });
+      }
+
+      const question = { id };
+      for (const key of QUIZ_COLUMNS) {
+        if (key === 'id') continue;
+        if (QUIZ_NUMERIC_FIELDS.has(key)) {
+          question[key] = Number(payload[key]) || 0;
+        } else {
+          question[key] = payload[key] != null ? String(payload[key]) : '';
+        }
+      }
+
+      const bank = await loadQuizBank(cfg);
+      const created = !(id in bank);
+      bank[id] = question;
+      await saveQuizBank(cfg, bank);
+
+      return send(res, created ? 201 : 200, JSON.stringify({ created, question }), { 'content-type': 'application/json' });
     }
 
     if (pathname === '/test') {
