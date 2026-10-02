@@ -19,6 +19,8 @@ Supports **Vercel** serverless deployments (stateless via HTTP-only cookies) or 
 In your Vercel project settings (**Settings > Environment Variables**), add:
 * `GOOGLE_CLIENT_ID` - Your Google OAuth Client ID
 * `GOOGLE_CLIENT_SECRET` - Your Google OAuth Client Secret
+* `UPSTASH_REDIS_REST_URL` *(optional)* - Upstash Redis REST URL for persisting OAuth tokens across serverless instances
+* `UPSTASH_REDIS_REST_TOKEN` *(optional)* - Upstash Redis REST Token
 * `GOOGLE_SCOPE` *(optional)* - Default: `https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly`
 
 ---
@@ -26,7 +28,7 @@ In your Vercel project settings (**Settings > Environment Variables**), add:
 ## 💻 Local Setup
 
 1. Under **Authorized redirect URIs** in GCP, add: `http://localhost:8080/callback`
-2. `cp .env.example .env` and fill in `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+2. `cp .env.example .env` and fill in `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and optionally `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`.
 3. Start the server:
    ```bash
    node server.js
@@ -37,6 +39,7 @@ In your Vercel project settings (**Settings > Environment Variables**), add:
 
 ## 🔒 Token Storage
 
-* **On Vercel**: Tokens are stored securely in stateless, `HttpOnly` cookies (`google_health_tokens`).
-* **Locally**: Tokens are stored in `HttpOnly` cookies and saved locally to `tokens.json`.
+* **Upstash Redis**: When `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` are set, OAuth tokens (both default tokens and clientKey-linked tokens) are persisted in Upstash Redis (`oauth:default_tokens` and `oauth:client:<clientKey>`).
+* **On Vercel**: Tokens are stored securely in `HttpOnly` cookies (`google_health_tokens`) and Upstash Redis if configured.
+* **Locally**: Tokens are stored in `HttpOnly` cookies, Upstash Redis (if configured), and saved locally to `tokens.json`.
 * Tokens auto-refresh when expired.

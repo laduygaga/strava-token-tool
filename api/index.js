@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { Redis } = require('@upstash/redis');
 
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.json');
 const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
@@ -12,6 +13,22 @@ const DEFAULT_SCOPE = 'https://www.googleapis.com/auth/googlehealth.activity_and
 const SKEW_SECONDS = 60; // refresh a minute early rather than racing expiry
 
 const CLIENT_KEY_TOKENS = new Map();
+let redisClient = null;
+
+function getRedis(cfg) {
+  const url = cfg?.upstashRedisRestUrl || process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = cfg?.upstashRedisRestToken || process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return null;
+  if (!redisClient) {
+    try {
+      redisClient = new Redis({ url, token });
+    } catch (e) {
+      console.error('Upstash Redis client initialization error:', e);
+      return null;
+    }
+  }
+  return redisClient;
+}
 
 function encodeState(csrf, clientKey) {
   if (!clientKey) return csrf;
@@ -53,7 +70,12 @@ function loadConfig(req) {
     clientId: get('GOOGLE_CLIENT_ID'),
     clientSecret: get('GOOGLE_CLIENT_SECRET'),
     scope: get('GOOGLE_SCOPE', DEFAULT_SCOPE),
+    upstashRedisRestUrl: get('UPSTASH_REDIS_REST_URL') || get('KV_REST_API_URL'),
+    upstashRedisRestToken: get('UPSTASH_REDIS_REST_TOKEN') || get('KV_REST_API_TOKEN'),
   };
+
+  if (cfg.upstashRedisRestUrl) process.env.UPSTASH_REDIS_REST_URL = cfg.upstashRedisRestUrl;
+  if (cfg.upstashRedisRestToken) process.env.UPSTASH_REDIS_REST_TOKEN = cfg.upstashRedisRestToken;
 
   if (req) {
     const proto = req.headers['x-forwarded-proto'] || 'https';
@@ -137,8 +159,10 @@ function loadClientKeysFile() {
   return {};
 }
 
-function loadTokens(req, targetClientKey) {
+async function loadTokens(req, targetClientKey, cfg) {
   let clientKey = targetClientKey;
+  const redis = getRedis(cfg);
+
   if (req) {
     let queryToken = null;
     try {
@@ -153,6 +177,18 @@ function loadTokens(req, targetClientKey) {
     if (clientKey) {
       if (CLIENT_KEY_TOKENS.has(clientKey)) {
         return CLIENT_KEY_TOKENS.get(clientKey);
+      }
+      if (redis) {
+        try {
+          const redisVal = await redis.get(`oauth:client:${clientKey}`);
+          if (redisVal) {
+            const parsed = typeof redisVal === 'string' ? JSON.parse(redisVal) : redisVal;
+            CLIENT_KEY_TOKENS.set(clientKey, parsed);
+            return parsed;
+          }
+        } catch (e) {
+          console.error('Error reading from Upstash Redis:', e);
+        }
       }
       const fileKeys = loadClientKeysFile();
       if (fileKeys[clientKey]) {
@@ -172,6 +208,18 @@ function loadTokens(req, targetClientKey) {
       if (CLIENT_KEY_TOKENS.has(tokenVal)) {
         return CLIENT_KEY_TOKENS.get(tokenVal);
       }
+      if (redis) {
+        try {
+          const redisVal = await redis.get(`oauth:client:${tokenVal}`);
+          if (redisVal) {
+            const parsed = typeof redisVal === 'string' ? JSON.parse(redisVal) : redisVal;
+            CLIENT_KEY_TOKENS.set(tokenVal, parsed);
+            return parsed;
+          }
+        } catch (e) {
+          console.error('Error reading bearer token from Upstash Redis:', e);
+        }
+      }
       const fileKeys = loadClientKeysFile();
       if (fileKeys[tokenVal]) {
         CLIENT_KEY_TOKENS.set(tokenVal, fileKeys[tokenVal]);
@@ -188,6 +236,17 @@ function loadTokens(req, targetClientKey) {
     }
   }
 
+  if (redis) {
+    try {
+      const redisVal = await redis.get('oauth:default_tokens');
+      if (redisVal) {
+        return typeof redisVal === 'string' ? JSON.parse(redisVal) : redisVal;
+      }
+    } catch (e) {
+      console.error('Error reading default tokens from Upstash Redis:', e);
+    }
+  }
+
   try {
     const text = fs.readFileSync(TOKENS_FILE, 'utf8').trim();
     if (!text) return null;
@@ -198,9 +257,21 @@ function loadTokens(req, targetClientKey) {
   return null;
 }
 
-function saveTokens(res, t, clientKey) {
+async function saveTokens(res, t, clientKey, cfg) {
   if (clientKey) {
     CLIENT_KEY_TOKENS.set(clientKey, t);
+  }
+
+  const redis = getRedis(cfg);
+  if (redis) {
+    try {
+      if (clientKey) {
+        await redis.set(`oauth:client:${clientKey}`, t);
+      }
+      await redis.set('oauth:default_tokens', t);
+    } catch (e) {
+      console.error('Error saving to Upstash Redis:', e);
+    }
   }
 
   if (res) {
@@ -236,7 +307,25 @@ function saveTokens(res, t, clientKey) {
   return t;
 }
 
-function clearTokens(res) {
+async function clearTokens(res, clientKey, cfg) {
+  if (clientKey) {
+    CLIENT_KEY_TOKENS.delete(clientKey);
+  } else {
+    CLIENT_KEY_TOKENS.clear();
+  }
+
+  const redis = getRedis(cfg);
+  if (redis) {
+    try {
+      if (clientKey) {
+        await redis.del(`oauth:client:${clientKey}`);
+      }
+      await redis.del('oauth:default_tokens');
+    } catch (e) {
+      console.error('Error deleting from Upstash Redis:', e);
+    }
+  }
+
   if (res) {
     appendCookie(res, 'google_health_tokens=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
     appendCookie(res, 'google_client_key=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
@@ -277,7 +366,7 @@ async function refresh(cfg, res, tokens, clientKey) {
     grant_type: 'refresh_token',
     refresh_token: tokens.refresh_token,
   });
-  return saveTokens(res, normalize(fresh, tokens), clientKey);
+  return await saveTokens(res, normalize(fresh, tokens), clientKey, cfg);
 }
 
 // ---------- html ----------
@@ -372,7 +461,7 @@ async function handler(req, res) {
 
   try {
     if (req.method === 'POST' && pathname === '/refresh') {
-      const tokens = loadTokens(req, clientKey);
+      const tokens = await loadTokens(req, clientKey, cfg);
       if (!tokens) return redirect(res, '/');
       try {
         const fresh = await refresh(cfg, res, tokens, clientKey);
@@ -383,7 +472,7 @@ async function handler(req, res) {
     }
 
     if (pathname === '/disconnect') {
-      clearTokens(res);
+      await clearTokens(res, clientKey, cfg);
       return redirect(res, clientKey ? `/?clientKey=${encodeURIComponent(clientKey)}` : '/');
     }
 
@@ -413,12 +502,12 @@ async function handler(req, res) {
         redirect_uri: cfg.redirectUri,
       });
       const resolvedClientKey = stateClientKey || clientKey;
-      saveTokens(res, normalize(granted), resolvedClientKey);
+      await saveTokens(res, normalize(granted), resolvedClientKey, cfg);
       return redirect(res, resolvedClientKey ? `/?clientKey=${encodeURIComponent(resolvedClientKey)}` : '/');
     }
 
     if (pathname === '/' || pathname === '') {
-      let tokens = loadTokens(req, clientKey);
+      let tokens = await loadTokens(req, clientKey, cfg);
       let error = null;
       if (tokens && isExpired(tokens)) {
         try {
@@ -440,7 +529,7 @@ async function handler(req, res) {
     }
 
     if (req.method === 'GET' && (pathname === '/v4/users/me/dataTypes/exercise/dataPoints' || pathname === '/dataPoints')) {
-      let tokens = loadTokens(req, clientKey);
+      let tokens = await loadTokens(req, clientKey, cfg);
       if (!tokens) return send(res, 401, JSON.stringify({ error: 'Not connected.' }), { 'content-type': 'application/json' });
       if (isExpired(tokens)) {
         try {
@@ -478,7 +567,7 @@ async function handler(req, res) {
     }
 
     if (pathname === '/test') {
-      let tokens = loadTokens(req, clientKey);
+      let tokens = await loadTokens(req, clientKey, cfg);
       if (!tokens) return send(res, 200, JSON.stringify({ status: 0, body: 'Not connected.' }), { 'content-type': 'application/json' });
       if (isExpired(tokens)) tokens = await refresh(cfg, res, tokens, clientKey);
       const r = await fetch(`${API}/users/me/dataTypes/exercise/dataPoints`, {
