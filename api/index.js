@@ -103,6 +103,137 @@ function authorizeUrl(cfg, state) {
 
 const isExpired = (t) => !t || !t.expires_at || t.expires_at - SKEW_SECONDS <= Date.now() / 1000;
 
+// Server-authoritative conversion: the game client only triggers a sync and never
+// computes or reports stats, so these formulas cannot be tampered with client-side.
+const STAT_RULES = {
+  distanceMmPerStr: 100000,
+  maxStatsPerRecord: 50,
+  maxStatsPerSync: 500,
+};
+
+// Physical sanity bounds: real Google Health data can still be gamed (e.g. a car
+// ride logged as a run), so implausible values are rejected before granting stats.
+const SANITY = {
+  minDistanceMm: 1,
+  maxDistanceMm: 500 * 1000 * 1000,
+  minPaceSecPerMeter: 0.1, // < 0.1 implies > 10 m/s (36 km/h) sustained — not human running
+  maxPaceSecPerMeter: 600, // > 600 implies slower than a slow walk — not a real run
+};
+
+function isPlausibleRecord(rec) {
+  const dist = Number(rec.distanceMillimeters);
+  const pace = Number(rec.averagePaceSecondsPerMeter);
+  if (!Number.isFinite(dist) || dist < SANITY.minDistanceMm || dist > SANITY.maxDistanceMm) {
+    return false;
+  }
+  if (rec.averagePaceSecondsPerMeter != null) {
+    if (!Number.isFinite(pace) || pace < SANITY.minPaceSecPerMeter || pace > SANITY.maxPaceSecPerMeter) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function statsForRecord(rec) {
+  const str = Math.floor(Number(rec.distanceMillimeters) / STAT_RULES.distanceMmPerStr);
+
+  let agi = 0;
+  const pace = Number(rec.averagePaceSecondsPerMeter);
+  if (Number.isFinite(pace) && pace > 0) {
+    agi = Math.floor(pace);
+  }
+
+  const clamp = (v) => Math.max(0, Math.min(STAT_RULES.maxStatsPerRecord, v));
+  return { str: clamp(str), agi: clamp(agi) };
+}
+
+// Reserves a recordId per clientKey exactly once (replay / double-count protection,
+// scoped so one user cannot claim another user's recordId). Returns true only the
+// first time a record is seen. The in-memory fallback is best-effort and does not
+// survive restarts or serverless instances; production must configure Upstash Redis.
+async function reserveRecord(redis, clientKey, recordId) {
+  if (!redis) {
+    const key = `${clientKey}:${recordId}`;
+    if (PROCESSED_RECORDS_MEM.has(key)) return false;
+    PROCESSED_RECORDS_MEM.add(key);
+    return true;
+  }
+  try {
+    // Redis SET NX writes only if the key is absent, giving an atomic first-seen check.
+    const res = await redis.set(`game:processed:${clientKey}:${recordId}`, 1, { nx: true });
+    return res === 'OK' || res === true;
+  } catch (e) {
+    // On storage failure, refuse to grant stats rather than risk double-counting.
+    console.error('Error reserving record in Redis:', e);
+    throw new Error('record-store-unavailable');
+  }
+}
+
+const PROCESSED_RECORDS_MEM = new Set();
+
+async function loadGameStats(redis, clientKey) {
+  const empty = { str: 0, agi: 0, recordCount: 0 };
+  if (!redis) return { ...(GAME_STATS_MEM.get(clientKey) || empty) };
+  try {
+    const val = await redis.get(`game:stats:${clientKey}`);
+    if (val) {
+      const parsed = typeof val === 'string' ? JSON.parse(val) : val;
+      return { ...empty, ...parsed };
+    }
+  } catch (e) {
+    console.error('Error reading game stats from Redis:', e);
+  }
+  return { ...empty };
+}
+
+async function saveGameStats(redis, clientKey, stats) {
+  if (!redis) {
+    GAME_STATS_MEM.set(clientKey, stats);
+    return;
+  }
+  try {
+    await redis.set(`game:stats:${clientKey}`, JSON.stringify(stats));
+  } catch (e) {
+    console.error('Error saving game stats to Redis:', e);
+  }
+}
+
+const GAME_STATS_MEM = new Map();
+
+// Single source of truth for exercise records, shared by the read-only /dataPoints
+// view and the stat-granting /sync path. MANUAL (self-reported) entries are dropped
+// here because they are trivially forgeable and must never grant stats.
+function normalizeDataPoints(body) {
+  if (!body || !Array.isArray(body.dataPoints)) return [];
+  return body.dataPoints
+    .filter((dp) => dp?.dataSource?.recordingMethod !== 'MANUAL')
+    .map((dp) => {
+      const nameParts = (dp.name || '').split('/');
+      const recordId = nameParts[nameParts.length - 1] || '';
+      const metrics = dp.exercise?.metricsSummary || {};
+      return {
+        recordId,
+        distanceMillimeters: metrics.distanceMillimeters,
+        averagePaceSecondsPerMeter: metrics.averagePaceSecondsPerMeter,
+      };
+    });
+}
+
+async function fetchExerciseRecords(url, tokens) {
+  const targetUrl = `${API}/users/me/dataTypes/exercise/dataPoints${cleanSearch(url)}`;
+  const r = await fetch(targetUrl, {
+    headers: { authorization: `Bearer ${tokens.access_token}` },
+  });
+  const text = await r.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return { status: r.status, records: null, raw: text };
+  }
+  return { status: r.status, records: normalizeDataPoints(body), raw: body };
+}
+
 function normalize(raw, prev = {}) {
   return {
     access_token: raw.access_token,
@@ -548,32 +679,76 @@ async function handler(req, res) {
           return send(res, 401, JSON.stringify({ error: `Token refresh failed: ${e.message}` }), { 'content-type': 'application/json' });
         }
       }
-      const targetUrl = `${API}/users/me/dataTypes/exercise/dataPoints${cleanSearch(url)}`;
-      const r = await fetch(targetUrl, {
-        headers: { authorization: `Bearer ${tokens.access_token}` },
-      });
-      const text = await r.text();
-      let body;
-      try {
-        body = JSON.parse(text);
-        if (Array.isArray(body.dataPoints)) {
-          body.dataPoints = body.dataPoints
-            .filter((dp) => dp?.dataSource?.recordingMethod !== 'MANUAL')
-            .map((dp) => {
-              const nameParts = (dp.name || '').split('/');
-              const recordId = nameParts[nameParts.length - 1] || '';
-              const metrics = dp.exercise?.metricsSummary || {};
-              return {
-                recordId,
-                distanceMillimeters: metrics.distanceMillimeters,
-                averagePaceSecondsPerMeter: metrics.averagePaceSecondsPerMeter,
-              };
-            });
-        }
-      } catch {
-        body = { raw: text };
+      const { status, records, raw } = await fetchExerciseRecords(url, tokens);
+      const body = records === null ? { raw } : { dataPoints: records };
+      return send(res, status, JSON.stringify(body), { 'content-type': 'application/json' });
+    }
+
+    if (req.method === 'POST' && pathname === '/sync') {
+      if (!clientKey) {
+        return send(res, 400, JSON.stringify({ error: 'Missing clientKey.' }), { 'content-type': 'application/json' });
       }
-      return send(res, r.status, JSON.stringify(body), { 'content-type': 'application/json' });
+      let tokens = await loadTokens(req, clientKey, cfg);
+      if (!tokens) return send(res, 401, JSON.stringify({ error: 'Not connected.' }), { 'content-type': 'application/json' });
+      if (isExpired(tokens)) {
+        try {
+          tokens = await refresh(cfg, res, tokens, clientKey);
+        } catch (e) {
+          return send(res, 401, JSON.stringify({ error: `Token refresh failed: ${e.message}` }), { 'content-type': 'application/json' });
+        }
+      }
+
+      const { status, records } = await fetchExerciseRecords(url, tokens);
+      if (!Array.isArray(records)) {
+        return send(res, 502, JSON.stringify({ error: 'Upstream data unavailable.' }), { 'content-type': 'application/json' });
+      }
+
+      const redis = getRedis(cfg);
+      const stats = await loadGameStats(redis, clientKey);
+      const awarded = [];
+      const rejected = [];
+      let syncStr = 0;
+      let syncAgi = 0;
+
+      try {
+        for (const rec of records) {
+          if (!rec.recordId) continue;
+          if (!isPlausibleRecord(rec)) {
+            rejected.push({ recordId: rec.recordId, reason: 'implausible' });
+            continue;
+          }
+
+          if (syncStr + syncAgi >= STAT_RULES.maxStatsPerSync) {
+            rejected.push({ recordId: rec.recordId, reason: 'sync-cap-reached' });
+            continue;
+          }
+
+          const isNew = await reserveRecord(redis, clientKey, rec.recordId);
+          if (!isNew) continue;
+
+          const delta = statsForRecord(rec);
+          syncStr += delta.str;
+          syncAgi += delta.agi;
+          awarded.push({ recordId: rec.recordId, ...delta });
+        }
+      } catch (e) {
+        if (e.message === 'record-store-unavailable') {
+          return send(res, 503, JSON.stringify({ error: 'Record store unavailable, try again.' }), { 'content-type': 'application/json' });
+        }
+        throw e;
+      }
+
+      stats.str += syncStr;
+      stats.agi += syncAgi;
+      stats.recordCount += awarded.length;
+      await saveGameStats(redis, clientKey, stats);
+
+      return send(res, status, JSON.stringify({
+        stats,
+        awarded,
+        rejected,
+        awardedCount: awarded.length,
+      }), { 'content-type': 'application/json' });
     }
 
     if (pathname === '/test') {
