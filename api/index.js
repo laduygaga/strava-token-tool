@@ -315,24 +315,24 @@ function connectPage(cfg, state, error, clientKey) {
 }
 
 function tokensPage(t, error, clientKey) {
-  const appToken = Buffer.from(JSON.stringify(t)).toString('base64url');
   const field = (label, value) => `
     <label>${label}</label>
     <div class="row">
       <code class="tok" id="${label.replace(/\W/g, '')}">${esc(value || '(none)')}</code>
       <button class="ghost" onclick="copy('${label.replace(/\W/g, '')}', this)">Copy</button>
     </div>`;
+  const disconnectUrl = `/disconnect${clientKey ? '?clientKey=' + encodeURIComponent(clientKey) : ''}`;
   return page(`
     <h1>Connected</h1>
     ${error ? `<p class="err">${esc(error)}</p>` : ''}
     ${clientKey ? field('Client Key', clientKey) : ''}
-    ${field('App token', appToken)}
-    <script>
+    <p><a class="btn" href="${esc(disconnectUrl)}">Disconnect</a></p>
+    ${clientKey ? `<script>
       function copy(id, btn) {
         navigator.clipboard.writeText(document.getElementById(id).textContent);
         btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy', 1200);
       }
-    </script>
+    </script>` : ''}
   `);
 }
 
@@ -384,7 +384,7 @@ async function handler(req, res) {
 
     if (pathname === '/disconnect') {
       clearTokens(res);
-      return redirect(res, '/');
+      return redirect(res, clientKey ? `/?clientKey=${encodeURIComponent(clientKey)}` : '/');
     }
 
     if (isCallback) {
