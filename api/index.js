@@ -428,13 +428,23 @@ function tokensPage(t, error, clientKey) {
 // ---------- handler ----------
 
 function send(res, status, body, headers = {}) {
-  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', ...headers });
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'access-control-allow-headers': '*',
+    ...headers,
+  });
   res.end(body);
 }
 
 const redirect = (res, to) => send(res, 302, '', { location: to });
 
 async function handler(req, res) {
+  if (req.method === 'OPTIONS') {
+    return send(res, 204, '');
+  }
+
   const cfg = loadConfig(req);
   if (!cfg.clientId || !cfg.clientSecret) {
     return send(res, 500, page('<p class="err">Missing <code>GOOGLE_CLIENT_ID</code> or <code>GOOGLE_CLIENT_SECRET</code> environment variables.</p>'));
